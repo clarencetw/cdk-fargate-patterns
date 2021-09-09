@@ -1,12 +1,28 @@
+import * as path from 'path';
+import * as acm from '@aws-cdk/aws-certificatemanager';
 import * as ec2 from '@aws-cdk/aws-ec2';
 import * as ecs from '@aws-cdk/aws-ecs';
 import * as elbv2 from '@aws-cdk/aws-elasticloadbalancingv2';
-import * as route53 from '@aws-cdk/aws-route53';
-import * as targets from '@aws-cdk/aws-route53-targets';
+import * as events from '@aws-cdk/aws-events';
+import * as event_targets from '@aws-cdk/aws-events-targets';
+import * as iam from '@aws-cdk/aws-iam';
+import * as lambda from '@aws-cdk/aws-lambda';
 import * as cdk from '@aws-cdk/core';
+import { getOrCreateVpc } from './common/common-functions';
 
 
-export interface DualAlbFargateServiceProps {
+export interface BaseFargateServiceProps {
+  /**
+   * The properties used to define an ECS cluster.
+   *
+   * @default - Create vpc and enable Fargate Capacity Providers.
+   */
+  readonly clusterProps?: ecs.ClusterProps;
+  /**
+   * Use existing ECS Cluster.
+   * @default - create a new ECS Cluster.
+   */
+  readonly cluster?: ecs.ICluster;
   readonly vpc?: ec2.IVpc;
   readonly tasks: FargateTaskProps[];
   readonly route53Ops?: Route53Options;
@@ -15,6 +31,12 @@ export interface DualAlbFargateServiceProps {
    * @default false
    */
   readonly spot?: boolean;
+  /**
+   * Enable the fargate spot termination handler
+   * @see https://docs.aws.amazon.com/AmazonECS/latest/developerguide/fargate-capacity-providers.html#fargate-capacity-providers-termination
+   * @default true
+   */
+  readonly spotTerminationHandler?: boolean;
   /**
    * Whether to enable ECS Exec support
    * @see https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-exec.html
@@ -29,26 +51,115 @@ export interface DualAlbFargateServiceProps {
    * }
    */
   readonly vpcSubnets?: ec2.SubnetSelection;
+  /**
+   * Enable the ECS service circuit breaker
+   * @see - https://aws.amazon.com/tw/blogs/containers/announcing-amazon-ecs-deployment-circuit-breaker/
+   * @default true
+   */
+  readonly circuitBreaker?: boolean;
 }
 
+/**
+ * The load balancer accessibility.
+ */
+export interface LoadBalancerAccessibility {
+  /**
+   * The port of the listener
+   */
+  readonly port: number;
+  /**
+   * The ACM certificate for the HTTPS listener
+   * @default - no certificate(HTTP only)
+   */
+  readonly certificate?: acm.ICertificate[];
+
+  /**
+  * Listener forward conditions.
+  * @default - no forward conditions.
+  */
+  readonly forwardConditions?: elbv2.ListenerCondition[];
+}
+
+/**
+ * Task properties for the Fargate
+ */
 export interface FargateTaskProps {
+  // The Fargate task definition
   readonly task: ecs.FargateTaskDefinition;
-  readonly listenerPort: number;
+
+  /**
+   * The internal ELB listener
+   * @default - no internal listener
+   */
+  readonly internal?: LoadBalancerAccessibility;
+
+  /**
+   * The external ELB listener
+   * @default - no external listener
+   */
+  readonly external?: LoadBalancerAccessibility;
+
   /**
    * desired number of tasks for the service
    * @default 1
    */
   readonly desiredCount?: number;
+
   /**
    * service autoscaling policy
+   * @default - { maxCapacity: 10, targetCpuUtilization: 50, requestsPerTarget: 1000 }
    */
   readonly scalingPolicy?: ServiceScalingPolicy;
-  readonly capacityProviderStrategy?: ecs.CapacityProviderStrategy[];
+
   /**
-   * Internal only. Do not expose the service on the internet-facing load balancer.
-   * @default false
+   * Customized capacity provider strategy
    */
-  readonly internalOnly?: boolean;
+  readonly capacityProviderStrategy?: ecs.CapacityProviderStrategy[];
+
+  /**
+   * health check from elbv2 target group
+  */
+  readonly healthCheck?: elbv2.HealthCheck;
+
+  /**
+   * The target group protocol for NLB. For ALB, this option will be ignored and always set to HTTP.
+   *
+   * @default - TCP
+   */
+  readonly protocol?: elbv2.Protocol;
+
+  /**
+   * The protocol version to use.
+   */
+  readonly protocolVersion?: elbv2.ApplicationProtocolVersion;
+
+  /**
+   * The serviceName.
+   *
+   * @default - auto-generated
+   */
+  readonly serviceName?: string;
+
+  /**
+   * The maximum number of tasks, specified as a percentage of the Amazon ECS service's DesiredCount value,
+   * that can run in a service during a deployment.
+   * @default 200
+  */
+  readonly maxHealthyPercent?: number;
+
+  /**
+   * The minimum number of tasks, specified as a percentage of the Amazon ECS service's DesiredCount value,
+   * that must continue to run and remain healthy during a deployment.
+   * @default 50
+  */
+  readonly minHealthyPercent?: number;
+
+  /**
+   * The period of time, in seconds,
+   * that the Amazon ECS service scheduler ignores unhealthy Elastic Load Balancing target health checks after a task has first started.
+   * @default cdk.Duration.seconds(60),
+  */
+  readonly healthCheckGracePeriod?: cdk.Duration;
 }
 
 export interface ServiceScalingPolicy {
@@ -71,65 +182,80 @@ export interface ServiceScalingPolicy {
 
 export interface Route53Options {
   /**
+   * Whether to configure the ALIAS for the LB.
+   * @default true
+   */
+  readonly enableLoadBalancerAlias?: boolean;
+  /**
    * private zone name
    * @default svc.local
    */
   readonly zoneName?: string;
   /**
-   * the external ALB record name
+   * the external ELB record name
    * @default external
    */
-  readonly externalAlbRecordName?: string;
+  readonly externalElbRecordName?: string;
   /**
-   * the internal ALB record name
+   * the internal ELB record name
    * @default internal
    */
-  readonly internalAlbRecordName?: string;
+  readonly internalElbRecordName?: string;
 }
 
-export class DualAlbFargateService extends cdk.Construct {
-  readonly externalAlb?: elbv2.ApplicationLoadBalancer
-  readonly internalAlb: elbv2.ApplicationLoadBalancer
+export abstract class BaseFargateService extends cdk.Construct {
+  /**
+   * The VPC
+   */
   readonly vpc: ec2.IVpc;
   /**
    * The service(s) created from the task(s)
    */
   readonly service: ecs.FargateService[];
-  private hasExternalLoadBalancer: boolean = false;
-  private vpcSubnets: ec2.SubnetSelection = { subnetType: ec2.SubnetType.PRIVATE };
+
+  protected zoneName: string = '';
+  protected hasExternalLoadBalancer: boolean = false;
+  protected hasInternalLoadBalancer: boolean = false;
+  protected vpcSubnets: ec2.SubnetSelection = { subnetType: ec2.SubnetType.PRIVATE };
+  protected enableLoadBalancerAlias: boolean;
+  private hasSpotCapacity: boolean = false;
   /**
    * determine if vpcSubnets are all public ones
    */
   private isPublicSubnets: boolean = false;
-  constructor(scope: cdk.Construct, id: string, props: DualAlbFargateServiceProps) {
+  constructor(scope: cdk.Construct, id: string, props: BaseFargateServiceProps) {
     super(scope, id);
 
-    this.vpc = props.vpc ?? getOrCreateVpc(this),
+    this.enableLoadBalancerAlias = props.route53Ops?.enableLoadBalancerAlias != false;
+    if (props.vpc && props.cluster) {
+      throw new Error('Cannot specify vpc and cluster at the same time');
+    }
+    if (props.clusterProps && props.cluster) {
+      throw new Error('Cannot specify clusterProps and cluster at the same time');
+    }
+    this.vpc = props.cluster ? props.cluster.vpc : props.vpc ?? getOrCreateVpc(this),
     this.service = [];
     if (props.vpcSubnets) {
       this.vpcSubnets = props.vpcSubnets;
       this.validateSubnets(this.vpc, this.vpcSubnets);
     }
+
+
     // determine whether we need the external LB
     props.tasks.forEach(t => {
-      if (!t.internalOnly) { this.hasExternalLoadBalancer = true; }
+      // determine the accessibility
+      if (t.external) {
+        this.hasExternalLoadBalancer = true;
+      }
+      if (t.internal) {
+        this.hasInternalLoadBalancer = true;
+      }
     });
 
-    if (this.hasExternalLoadBalancer) {
-      this.externalAlb = new elbv2.ApplicationLoadBalancer(this, 'ExternalAlb', {
-        vpc: this.vpc,
-        internetFacing: true,
-      });
-    }
-
-    this.internalAlb = new elbv2.ApplicationLoadBalancer(this, 'InternalAlb', {
-      vpc: this.vpc,
-      internetFacing: false,
-    });
-
-    const cluster = new ecs.Cluster(this, 'Cluster', {
+    const cluster = props.cluster ?? new ecs.Cluster(this, 'Cluster', {
       vpc: this.vpc,
       enableFargateCapacityProviders: true,
+      ...props.clusterProps,
     });
 
     const spotOnlyStrategy = [
@@ -145,100 +271,87 @@ export class DualAlbFargateService extends cdk.Construct {
       },
     ];
 
+    if (props.spot == true) this.hasSpotCapacity = true;
+
     props.tasks.forEach(t => {
       const defaultContainerName = t.task.defaultContainer?.containerName;
       const svc = new ecs.FargateService(this, `${defaultContainerName}Service`, {
         taskDefinition: t.task,
         cluster,
+        serviceName: t.serviceName,
         capacityProviderStrategies: t.capacityProviderStrategy ?? ( props.spot ? spotOnlyStrategy : undefined ),
         desiredCount: t.desiredCount,
         enableExecuteCommand: props.enableExecuteCommand ?? false,
         vpcSubnets: this.vpcSubnets,
         assignPublicIp: this.isPublicSubnets,
+        circuitBreaker: props.circuitBreaker != false ? {
+          rollback: true,
+        } : undefined,
+        maxHealthyPercent: t.maxHealthyPercent,
+        minHealthyPercent: t.minHealthyPercent,
+        healthCheckGracePeriod: t.healthCheckGracePeriod,
       });
       this.service.push(svc);
 
-      // default scaling policy
-      const scaling = svc.autoScaleTaskCount({ maxCapacity: t.scalingPolicy?.maxCapacity ?? 10 });
-      scaling.scaleOnCpuUtilization('CpuScaling', {
-        targetUtilizationPercent: t.scalingPolicy?.targetCpuUtilization ?? 50,
+      /**
+       * determine if we have spot capacity in this cluster
+       * scenario 1: FARGATE_SPOT with weight > 0
+       * scenario 2: FARGATE_SPOT with base > 0
+       * scenario 3: props.spot = true
+       */
+      t.capacityProviderStrategy?.forEach(s => {
+        if (s.capacityProvider == 'FARGATE_SPOT' && ((s.weight && s.weight > 0)
+          || (s.base && s.base > 0))) {
+          this.hasSpotCapacity = true;
+        }
       });
-
-      // not internalOnly
-      if (!t.internalOnly) {
-        const exttg = new elbv2.ApplicationTargetGroup(this, `${defaultContainerName}ExtTG`, {
-          protocol: elbv2.ApplicationProtocol.HTTP,
-          vpc: this.vpc,
-        });
-        // listener for the external ALB
-        new elbv2.ApplicationListener(this, `ExtAlbListener${t.listenerPort}`, {
-          loadBalancer: this.externalAlb!,
-          open: true,
-          port: t.listenerPort,
-          protocol: elbv2.ApplicationProtocol.HTTP,
-          defaultTargetGroups: [exttg],
-        });
-        scaling.scaleOnRequestCount('RequestScaling', {
-          requestsPerTarget: t.scalingPolicy?.requestPerTarget ?? 1000,
-          targetGroup: exttg,
-        });
-        exttg.addTarget(svc);
-      }
-
-      const inttg = new elbv2.ApplicationTargetGroup(this, `${defaultContainerName}IntTG`, {
-        protocol: elbv2.ApplicationProtocol.HTTP,
-        vpc: this.vpc,
-      });
-
-      // listener for the internal ALB
-      new elbv2.ApplicationListener(this, `IntAlbListener${t.listenerPort}`, {
-        loadBalancer: this.internalAlb,
-        open: true,
-        port: t.listenerPort,
-        protocol: elbv2.ApplicationProtocol.HTTP,
-        defaultTargetGroups: [inttg],
-      });
-
-
-      // extra scaling policy
-      scaling.scaleOnRequestCount('RequestScaling2', {
-        requestsPerTarget: t.scalingPolicy?.requestPerTarget ?? 1000,
-        targetGroup: inttg,
-      });
-
-      inttg.addTarget(svc);
     });
+    // ensure the dependency
+    if (!props.cluster) {
+      const cp = this.node.tryFindChild('Cluster') as ecs.CfnClusterCapacityProviderAssociations;
+      this.service.forEach(s => {
+        s.node.addDependency(cp);
+      });
+    };
 
     // Route53
-    const zoneName = props.route53Ops?.zoneName ?? 'svc.local';
-    const externalAlbRecordName = props.route53Ops?.externalAlbRecordName ?? 'external';
-    const internalAlbRecordName = props.route53Ops?.internalAlbRecordName ?? 'internal';
-    const zone = new route53.PrivateHostedZone(this, 'HostedZone', {
-      zoneName,
-      vpc: this.vpc,
-    });
+    this.zoneName = props.route53Ops?.zoneName ?? 'svc.local';
 
-    new route53.ARecord(this, 'InternalAlbAlias', {
-      zone,
-      recordName: internalAlbRecordName,
-      target: route53.RecordTarget.fromAlias(new targets.LoadBalancerTarget(this.internalAlb)),
-    });
-
-    if (this.externalAlb) {
-      new route53.ARecord(this, 'ExternalAlbAlias', {
-        zone,
-        recordName: externalAlbRecordName,
-        target: route53.RecordTarget.fromAlias(new targets.LoadBalancerTarget(this.externalAlb)),
-      });
+    // spot termination handler by default
+    if (this.hasSpotCapacity && props.spotTerminationHandler !== false) {
+      this.createSpotTerminationHandler(cluster);
     }
 
-
-    if (this.externalAlb) {
-      new cdk.CfnOutput(this, 'ExternalEndpoint', { value: `http://${this.externalAlb.loadBalancerDnsName}` });
-      new cdk.CfnOutput(this, 'ExternalEndpointPrivate', { value: `http://${externalAlbRecordName}.${zoneName}` });
+    // add solution ID for the stack
+    if (!cdk.Stack.of(this).templateOptions.description) {
+      cdk.Stack.of(this).templateOptions.description = '(SO8030) - AWS CDK stack with cdk-fargate-patterns';
     }
-    new cdk.CfnOutput(this, 'InternalEndpoint', { value: `http://${this.internalAlb.loadBalancerDnsName}` });
-    new cdk.CfnOutput(this, 'InternalEndpointPrivate', { value: `http://${internalAlbRecordName}.${zoneName}` });
+  }
+  private createSpotTerminationHandler(cluster: ecs.ICluster) {
+  // create the handler
+    const handler = new lambda.DockerImageFunction(this, 'SpotTermHandler', {
+      code: lambda.DockerImageCode.fromImageAsset(path.join(__dirname, '../lambda/spot-term-handler')),
+      timeout: cdk.Duration.seconds(20),
+    });
+    // create event rule
+    const rule = new events.Rule(this, 'OnTaskStateChangeEvent', {
+      eventPattern: {
+        source: ['aws.ecs'],
+        detailType: ['ECS Task State Change'],
+        detail: {
+          clusterArn: [cluster.clusterArn],
+        },
+      },
+    });
+    rule.addTarget(new event_targets.LambdaFunction(handler));
+    handler.addToRolePolicy(new iam.PolicyStatement({
+      actions: [
+        'ecs:DescribeServices',
+        'elasticloadbalancing:DeregisterTargets',
+        'ec2:DescribeSubnets',
+      ],
+      resources: ['*'],
+    }));
   }
 
   private validateSubnets(vpc: ec2.IVpc, vpcSubnets: ec2.SubnetSelection) {
@@ -261,13 +374,4 @@ export class DualAlbFargateService extends cdk.Construct {
     }
     this.isPublicSubnets = subnets.subnetIds.some(s => new Set(vpc.publicSubnets.map(x => x.subnetId)).has(s));
   }
-}
-
-function getOrCreateVpc(scope: cdk.Construct): ec2.IVpc {
-  // use an existing vpc or create a new one
-  return scope.node.tryGetContext('use_default_vpc') === '1'
-    || process.env.CDK_USE_DEFAULT_VPC === '1' ? ec2.Vpc.fromLookup(scope, 'Vpc', { isDefault: true }) :
-    scope.node.tryGetContext('use_vpc_id') ?
-      ec2.Vpc.fromLookup(scope, 'Vpc', { vpcId: scope.node.tryGetContext('use_vpc_id') }) :
-      new ec2.Vpc(scope, 'Vpc', { maxAzs: 3, natGateways: 1 });
 }

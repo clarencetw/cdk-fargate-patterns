@@ -1,0 +1,155 @@
+version: '3'
+
+networks:
+  default:
+
+services:
+  golang-order:
+    build:
+      context: ./golang/OrderService
+      dockerfile: Dockerfile
+    container_name: order
+    ports:
+      - 80:8080
+    environment: 
+      - PRODUCT_SVC_URL=http://golang-product:8080
+      - CUSTOMER_SVC_URL=http://golang-customer:8080
+      - WAREHOUSE_SVC_URL=http://nginx-php:80/api.php
+      - serviceName=order
+      - versionNum=1.0
+    networks:
+      - default
+  golang-customer:
+    build:
+      context: ./golang/CommonService
+      dockerfile: Dockerfile
+    container_name: customer
+    ports:
+      - 8080:8080
+    environment: 
+      - PRODUCT_SVC_URL=http://golang-product:8080
+      - CUSTOMER_SVC_URL=http://golang-customer:8080
+      - serviceName=customer
+      - versionNum=1.0
+    networks:
+      - default
+  golang-product:
+    build:
+      context: ./golang/CommonService
+      dockerfile: Dockerfile
+    container_name: product
+    ports:
+      - 9090:8080
+    environment: 
+      - PRODUCT_SVC_URL=http://golang-product:8080
+      - CUSTOMER_SVC_URL=http://golang-customer:8080
+      - serviceName=product
+      - versionNum=1.0
+    networks:
+      - default
+  nginx:
+    image: 'nginx:latest'
+    container_name: nginx
+    ports:
+      - 9091:80
+    networks:
+      - default 
+  nginx-php:
+    build:
+      context: ./nginx-php
+      dockerfile: Dockerfile
+    container_name: php
+    ports:
+      - 9092:80
+    environment: 
+      - serviceName=warehouse
+      - versionNum=0.1
+    networks:
+      - default 
+  nuxt:
+    build:
+      context: ./nuxt
+      dockerfile: Dockerfile
+    container_name: nuxt
+    ports:
+      - 9093:80
+    networks:
+      - default 
+  node:
+    build:
+      context: ./node
+      dockerfile: Dockerfile
+    container_name: node
+    ports:
+      - 9094:80
+    networks:
+      - default 
+  laravel-nginx-php-fpm:
+    build:
+      context: ./laravel-nginx-php-fpm
+      dockerfile: Dockerfile
+    container_name: laravel-nginx
+    ports:
+      - 9095:80
+    networks:
+      - default
+  laravel-bitnami:
+    build:
+      context: ./laravel-bitnami
+      dockerfile: Dockerfile
+    container_name: laravel-bitnami
+    ports:
+      - 9096:3000
+    networks:
+      - default
+  java:
+    build:
+      context: ./java-spring-boot
+      dockerfile: Dockerfile
+    container_name: java
+    ports:
+      - 9097:8080
+    networks:
+      - default
+  apache-php:
+    build:
+      context: ./apache-php
+      dockerfile: Dockerfile
+    container_name: apache-php
+    ports:
+      - 9098:80
+    networks:
+      - default 
+  python-flask:
+    build:
+      context: ./python-flask
+      dockerfile: Dockerfile
+    container_name: flask
+    ports:
+      - 9099:80
+    networks:
+      - default
+  gorilla-mux:
+    build:
+      context: ./golang/gorilla-mux
+      dockerfile: Dockerfile
+    container_name: mux
+    ports:
+      - 9100:8080
+    environment: 
+      - serviceName=mux
+      - versionNum=1.0
+    networks:
+      - default
+  go-grpc:
+    build:
+      context: ./golang/go-grpc
+      dockerfile: Dockerfile
+    container_name: go-grpc
+    ports:
+      - 50051:50051
+    environment: 
+      - SERVER_PORT=50051
+      - AWS_EXECUTION_ENV=LocalDev
+    networks:
+      - default
